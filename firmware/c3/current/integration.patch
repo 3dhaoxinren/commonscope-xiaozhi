@@ -1,0 +1,588 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -9,5 +9,5 @@
+ # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
+ idf_build_set_property(MINIMAL_BUILD ON)
+ 
+-set(PROJECT_VER "2.6.0")
++set(PROJECT_VER "6.4.3-cs3lan")
+ project(xiaozhi)
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -91,7 +91,9 @@
+ 
+ # Select the board source directory from Kconfig
+ # Set default assets if the board uses partition table V2
+-if(CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI)
++if(CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT)
++    set(BOARD_DIR "commonscope-c3-ptt")
++elseif(CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI)
+     set(BOARD_DIR "bread-compact-wifi")
+     set(BUILTIN_TEXT_FONT font_noto_sans_basic_14_1)
+     set(BUILTIN_ICON_FONT font_material_symbols_14_1)
+@@ -1198,6 +1200,7 @@
+ if(IDF_TARGET STREQUAL "esp32s3")
+     list(APPEND MAIN_PRIV_REQUIRES_EXTRA esp_driver_usb_serial_jtag)
+ endif()
++list(APPEND MAIN_PRIV_REQUIRES_EXTRA esp_http_client nvs_flash esp_wifi lwip)
+ idf_component_register(SRCS ${SOURCES}
+                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
+                     INCLUDE_DIRS ${INCLUDE_DIRS}
+--- a/main/Kconfig.projbuild
++++ b/main/Kconfig.projbuild
+@@ -187,6 +187,9 @@
+     config BOARD_TYPE_CHD_ESP32S3_EYE
+         bool "CHD ESP32-S3-EYE (虫洞)"
+         depends on IDF_TARGET_ESP32S3
++    config BOARD_TYPE_COMMONSCOPE_C3_PTT
++        bool "CommonScope C3 PTT (original display)"
++        depends on IDF_TARGET_ESP32C3
+     config BOARD_TYPE_CYBERAI_VOCAT_V2_0
+         bool "Cyberai-Vocat-V2.0"
+         depends on IDF_TARGET_ESP32S3
+@@ -681,6 +684,26 @@
+         depends on IDF_TARGET_ESP32S3
+ endchoice
+ 
++config COMMONSCOPE_C3_BENCH
++    bool "CommonScope C3 standalone BOOT audio bench"
++    depends on BOARD_TYPE_COMMONSCOPE_C3_PTT
++    default n
++    help
++        Enable BOOT audio tests instead of commanding the original board.
++        UART stays off unless the separate passive RX monitor is selected.
++
++config COMMONSCOPE_C3_XZVIEW
++    bool "CommonScope B07C opt-in display transmitter"
++    depends on COMMONSCOPE_C3_RXMON
++    default n
++
++config COMMONSCOPE_C3_RXMON
++    bool "CommonScope passive original-board UART monitor"
++    depends on COMMONSCOPE_C3_BENCH
++    default n
++    help
++        Listen on GPIO3 without assigning any transmit pin. Keep BOOT audio tests.
++
+ config RESPEAKER_I2S_EXTERNAL_CLOCK_48K
+     bool "ReSpeaker: XMOS supplies 48 kHz I2S clocks"
+     depends on BOARD_TYPE_SEEED_XIAO_ESP32S3_RESPEAKER_XVF3800
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -20,6 +20,17 @@
+ #include <cstring>
+ #include <limits>
+ 
++extern "C" void cs_observe_audio_send(bool) __attribute__((weak));
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++#include "boards/commonscope-c3-ptt/follow_loop.h"
++#include "esp_timer.h"
++static CsFollow cs_loop;
++static uint32_t cs_now(){return (uint32_t)(esp_timer_get_time()/1000);}
++extern "C" unsigned cs_follow_audio_gate(bool on);
++extern "C" unsigned cs_follow_pulses();
++extern "C" bool cs_maintenance_busy();
++extern "C" void cs_voice_path_seen(unsigned path);
++#endif
+ #define TAG "Application"
+ 
+ Application::Application() : notify_player_(audio_service_) {
+@@ -202,12 +213,16 @@
+         MAIN_EVENT_NETWORK_CONNECTED | MAIN_EVENT_NETWORK_DISCONNECTED | MAIN_EVENT_TOGGLE_CHAT |
+         MAIN_EVENT_START_LISTENING | MAIN_EVENT_STOP_LISTENING | MAIN_EVENT_ACTIVATION_DONE |
+         MAIN_EVENT_STATE_CHANGED | MAIN_EVENT_PLAYBACK_DRAINED | MAIN_EVENT_STARTUP_HINT_TIMEOUT |
+-        MAIN_EVENT_PROTOCOL_PENDING;
++        MAIN_EVENT_PROTOCOL_PENDING | MAIN_EVENT_FOLLOW_TICK;
+ 
+     while (true) {
+         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
+ 
+         if (bits & MAIN_EVENT_ERROR) {
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++            CsForgetFollow();
++#endif
++
+             if (GetDeviceState() == kDeviceStateNotifying) {
+                 StopNotification();
+             }
+@@ -233,6 +248,10 @@
+         }
+ 
+         if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++            CsPollFollow();
++#endif
++
+             if (audio_service_.IsPlaybackIdle()) {
+                 notify_player_.OnPlaybackDrained();
+             }
+@@ -261,9 +280,15 @@
+             protocol_->ProcessPending();
+         }
+ 
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++        if(bits & MAIN_EVENT_FOLLOW_TICK)CsPollFollow();
++#endif
+         if (bits & MAIN_EVENT_SEND_AUDIO) {
++            unsigned burst=0;
+             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
+-                if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
++                bool failed = protocol_ && !protocol_->SendAudio(std::move(packet));
++                if (protocol_ && cs_observe_audio_send) cs_observe_audio_send(!failed);
++                if (failed) {
+                     // Drop the remaining packets. Leaving them in the queue would
+                     // stall the Opus codec task (it waits for queue space), which in
+                     // turn deadlocks the whole audio input pipeline, as no new
+@@ -272,6 +297,11 @@
+                         ;
+                     break;
+                 }
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++                if(++burst>=3){xEventGroupSetBits(event_group_,MAIN_EVENT_SEND_AUDIO);break;}
++#else
++                (void)burst;
++#endif
+             }
+         }
+ 
+@@ -296,6 +326,9 @@
+         }
+ 
+         if (bits & MAIN_EVENT_CLOCK_TICK) {
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++            CsPollFollow();
++#endif
+             clock_ticks_++;
+             auto display = Board::GetInstance().GetDisplay();
+             display->UpdateStatusBar();
+@@ -342,6 +375,10 @@
+ }
+ 
+ void Application::HandleNetworkDisconnectedEvent() {
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++    CsForgetFollow();
++#endif
++
+     // Close current conversation when network disconnected
+     auto state = GetDeviceState();
+     if (state == kDeviceStateNotifying) {
+@@ -529,6 +566,7 @@
+         retry_count = 0;
+         retry_delay = 10;  // Reset retry delay
+ 
++        #if !CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT
+         if (ota_->HasNewVersion()) {
+             if (UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion())) {
+                 return;  // This line will never be reached after reboot
+@@ -536,6 +574,7 @@
+             // If upgrade failed, continue to normal operation
+         }
+ 
++        #endif
+         // No new version, mark the current version as valid
+         ota_->MarkCurrentVersionValid();
+         if (!ota_->HasActivationCode() && !ota_->HasActivationChallenge()) {
+@@ -609,6 +648,11 @@
+     protocol_->OnAudioChannelClosed([this, &board]() {
+         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+         Schedule([this]() {
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++            if(protocol_ && protocol_->IsAudioChannelOpened()) return; // old close notification
++            CsForgetFollow();
++#endif
++
+             auto display = Board::GetInstance().GetDisplay();
+             display->SetChatMessage("system", "");
+             SetDeviceState(kDeviceStateIdle);
+@@ -662,12 +706,23 @@
+             }
+             if (strcmp(state->valuestring, "start") == 0) {
+                 Schedule([this]() {
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++                    if(!protocol_ || !protocol_->IsAudioChannelOpened() || cs_maintenance_busy())return;
++                    cs_wait_reply_.store(false);cs_follow_audio_gate(false);cs_loop.talking(cs_now());
++#endif
+                     aborted_ = false;
+                     SetDeviceState(kDeviceStateSpeaking);
+                 });
+             } else if (strcmp(state->valuestring, "stop") == 0) {
+                 Schedule([this]() {
+                     if (GetDeviceState() == kDeviceStateSpeaking) {
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++                        if(cs_loop.p==CsFollow::Talking){
++                            cs_loop.stop_tts(cs_now()); CsPollFollow(); return;
++                        }
++                        if(cs_loop.p==CsFollow::Drain)return; // duplicate stop
++                        SetDeviceState(kDeviceStateIdle); return; // stale TTS cannot reopen mic
++#endif
+                         if (listening_mode_ == kListeningModeManualStop) {
+                             SetDeviceState(kDeviceStateIdle);
+                         } else {
+@@ -700,9 +755,15 @@
+                     glyphs.clear();
+                 }
+                 ESP_LOGI(TAG, ">> %s", text->valuestring);
+-                Schedule([display, message = std::string(text->valuestring),
++                Schedule([this,display, message = std::string(text->valuestring),
+                           glyphs = std::move(glyphs), bpp]() {
+                     display->AddTextGlyphs(glyphs, bpp);
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++                    if(!message.empty() && cs_loop.p==CsFollow::Mic){
++                        cs_loop.recognized(cs_now());cs_wait_reply_.store(true);cs_follow_audio_gate(false);
++                        audio_service_.EnableVoiceProcessing(false);
++                    }
++#endif
+                     display->SetChatMessage("user", message.c_str());
+                 });
+             }
+@@ -858,11 +919,24 @@
+ }
+ 
+ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
+-    // Check state again in case it was changed during scheduling
++    // Check state again in case it was changed during scheduling.
+     if (GetDeviceState() != kDeviceStateConnecting) {
+         return;
+     }
+ 
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT
++    if (mode == kListeningModeManualStop && cs_ptt_intent_.load() != 1) {
++        SetDeviceState(kDeviceStateIdle);
++        return;
++    }
++#endif
++
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++    // No wake inference while speaking to the cloud. Return detector working RAM
++    // to the Wi-Fi/TLS and Opus paths. The model weights stay mapped in Flash.
++    audio_service_.EnableWakeWordDetection(false);
++    audio_service_.ReleaseWakeWordResources();
++#endif
+     // Switch to performance mode before connecting to reduce latency
+     auto& board = Board::GetInstance();
+     board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+@@ -876,6 +950,13 @@
+         }
+     }
+ 
++
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT
++    if(mode==kListeningModeManualStop && cs_ptt_intent_.load()!=1){
++        if(protocol_ && protocol_->IsAudioChannelOpened())protocol_->CloseAudioChannel();
++        SetDeviceState(kDeviceStateIdle);return;
++    }
++#endif
+     SetListeningMode(mode);
+ }
+ 
+@@ -938,6 +1019,17 @@
+     }
+ 
+     auto state = GetDeviceState();
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++    // The physical PTT or a paired maintenance window owns the board. A stale
++    // detection queued during TTS must never start or cancel another session.
++    if (CsFollowActive())return;
++    if (state != kDeviceStateIdle || cs_maintenance_busy() ||
++        cs_ptt_intent_.load() == 1 || !audio_service_.IsPlaybackIdle()) {
++        if (state == kDeviceStateIdle && !cs_maintenance_busy())
++            audio_service_.EnableWakeWordDetection(true);
++        return;
++    }
++#endif
+     auto wake_word = audio_service_.GetLastWakeWord();
+     ESP_LOGI(TAG, "Wake word detected: %s (state: %d)", wake_word.c_str(), (int)state);
+ 
+@@ -999,6 +1091,12 @@
+         return;
+     }
+ 
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++    // No wake inference while speaking to the cloud. Return detector working RAM
++    // to the Wi-Fi/TLS and Opus paths. The model weights stay mapped in Flash.
++    audio_service_.EnableWakeWordDetection(false);
++    audio_service_.ReleaseWakeWordResources();
++#endif
+     // Switch to performance mode before connecting to reduce latency
+     auto& board = Board::GetInstance();
+     board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+@@ -1027,6 +1125,9 @@
+     // (PlaySound here would be cleared by ResetDecoder in EnableVoiceProcessing)
+     play_popup_on_listening_ = true;
+     SetListeningMode(GetDefaultListeningMode());
++#endif
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++    if (GetDeviceState() == kDeviceStateListening) {cs_loop.first_wake(cs_now());cs_follow_active_.store(true);cs_voice_path_seen(5);}
+ #endif
+ }
+ 
+@@ -1055,7 +1156,10 @@
+                     "neutral");  // Then set emotion (wechat mode checks child count)
+             }
+             audio_service_.EnableVoiceProcessing(false);
+-            audio_service_.EnableWakeWordDetection(true);
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++            if (!cs_maintenance_busy() && !CsFollowActive())
++#endif
++                audio_service_.EnableWakeWordDetection(true);
+             break;
+         case kDeviceStateConnecting:
+             display->SetStatus(Lang::Strings::CONNECTING);
+@@ -1067,7 +1171,11 @@
+             display->SetEmotion("neutral");
+ 
+             // Make sure the audio processor is running
+-            if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
++            if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++                || cs_loop.p==CsFollow::Starting
++#endif
++            ) {
+                 // For auto mode, wait for the playback queue to drain before enabling
+                 // voice processing. This prevents audio truncation when STOP arrives
+                 // late due to network jitter. Instead of blocking the main loop here,
+@@ -1183,6 +1291,19 @@
+ 
+     // Send the start listening command
+     protocol_->SendStartListening(listening_mode_);
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++    // Cover manual listening and any listening path that did not arrive via the wake callback.
++    // Manual release still submits normally. It cannot leave an un-timed "listening" state.
++    if(cs_loop.p==CsFollow::Off && (listening_mode_==kListeningModeManualStop || listening_mode_==kListeningModeAutoStop)){
++        cs_loop.first_wake(cs_now());cs_follow_active_.store(true);
++    }
++    if(cs_loop.p==CsFollow::Starting && (listening_mode_==kListeningModeAutoStop || listening_mode_==kListeningModeManualStop)){
++        cs_wait_reply_.store(false);
++        cs_loop.opened(cs_now(),cs_follow_audio_gate(true));
++        if(cs_loop.resumed)cs_voice_path_seen(7);
++    }
++#endif
++
+     audio_service_.EnableVoiceProcessing(true);
+ 
+     ConfigureWakeWordForListening();
+@@ -1205,7 +1326,11 @@
+ }
+ 
+ void Application::StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles) {
+-    if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy()) {
++    if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy()
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++        || CsFollowActive()
++#endif
++    ) {
+         ESP_LOGW(TAG, "Ignoring notify message while device is busy");
+         return;
+     }
+@@ -1312,6 +1437,10 @@
+ }
+ 
+ bool Application::UpgradeFirmware(const std::string& url, const std::string& version) {
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT
++    // Never interrupt voice or accept a URL-based updater on the locally paired lane.
++    return false;
++#endif
+     auto& board = Board::GetInstance();
+     auto display = board.GetDisplay();
+ 
+@@ -1467,6 +1596,10 @@
+ 
+ void Application::ResetProtocol() {
+     Schedule([this]() {
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++        CsForgetFollow();
++#endif
++
+         if (GetDeviceState() == kDeviceStateNotifying) {
+             StopNotification();
+         }
+@@ -1478,3 +1611,71 @@
+         protocol_.reset();
+     });
+ }
++
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++void Application::CsForgetFollow(){
++    cs_loop.clear();cs_follow_active_.store(false);cs_wait_reply_.store(false);cs_follow_audio_gate(false);
++}
++void Application::CsPollFollow(){
++    if(cs_loop.p==CsFollow::Off){
++        if(GetDeviceState()!=kDeviceStateListening)return;
++        // No window owner but the live state says listening: do not leave the mic open.
++        cs_loop.first_wake(cs_now());cs_follow_active_.store(true);
++        cs_loop.opened(cs_now(),cs_follow_audio_gate(true));
++    }
++    const bool allowed=protocol_ && protocol_->IsAudioChannelOpened() && !cs_maintenance_busy();
++    const auto a=cs_loop.poll(cs_now(),allowed,audio_service_.IsPlaybackIdle(),cs_follow_pulses());
++    if(a==CsFollow::Listen && GetDeviceState()==kDeviceStateSpeaking){
++        play_popup_on_listening_=false;
++        SetListeningMode(kListeningModeAutoStop);return;
++    }
++    if(a==CsFollow::None)return;
++    const auto why=cs_loop.end_code;CsForgetFollow();cs_voice_path_seen(8);if(why)cs_voice_path_seen(why);
++    // Publish the real idle transition to the panel before any network cleanup can block.
++    bool was_idle=GetDeviceState()==kDeviceStateIdle;
++    if(!was_idle)SetDeviceState(kDeviceStateIdle);
++    audio_service_.EnableVoiceProcessing(false);
++    while(audio_service_.PopPacketFromSendQueue()){}
++    if(protocol_ && protocol_->IsAudioChannelOpened())protocol_->CloseAudioChannel();
++    if(was_idle && !cs_maintenance_busy())audio_service_.EnableWakeWordDetection(true);
++}
++
++#endif
++void Application::CsPttIntent(unsigned mode) {
++    cs_ptt_intent_.store(mode);
++    Schedule([this, mode]() {
++        if (cs_ptt_intent_.load() != mode) return;
++        auto state = GetDeviceState();
++#if CONFIG_COMMONSCOPE_C3_BENCH
++        if (state == kDeviceStateWifiConfiguring && mode == 1) {
++            HandleStartListeningEvent();
++            return;
++        }
++        if (state == kDeviceStateAudioTesting && (mode == 2 || mode == 3)) {
++            HandleStopListeningEvent();
++            return;
++        }
++#endif
++        if (mode == 1 && state == kDeviceStateIdle) {
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++            if(CsFollowActive()) return;
++#endif
++
++            HandleStartListeningEvent();
++        } else if (mode == 2 && state == kDeviceStateListening) {
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++            if(listening_mode_!=kListeningModeManualStop)return;
++            cs_loop.submit(cs_now());cs_wait_reply_.store(true);cs_follow_audio_gate(false);cs_follow_active_.store(true);
++#endif
++            HandleStopListeningEvent();
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++            if (listening_mode_ == kListeningModeManualStop && GetDeviceState() == kDeviceStateIdle)
++                cs_voice_path_seen(6);
++#endif
++        } else if ((mode == 3 && (state == kDeviceStateConnecting || state == kDeviceStateListening)) ||
++                   (mode == 2 && state == kDeviceStateConnecting)) {
++            if (protocol_ && protocol_->IsAudioChannelOpened()) protocol_->CloseAudioChannel();
++            SetDeviceState(kDeviceStateIdle);
++        }
++    });
++}
+--- a/main/application.h
++++ b/main/application.h
+@@ -7,6 +7,7 @@
+ #include <esp_timer.h>
+ 
+ #include <string>
++#include <atomic>
+ #include <mutex>
+ #include <deque>
+ #include <memory>
+@@ -38,6 +39,7 @@
+ #define MAIN_EVENT_PLAYBACK_DRAINED     (1 << 13)
+ #define MAIN_EVENT_STARTUP_HINT_TIMEOUT (1 << 14)
+ #define MAIN_EVENT_PROTOCOL_PENDING (1 << 15)
++#define MAIN_EVENT_FOLLOW_TICK (1 << 16)
+ 
+ enum AecMode {
+     kAecOff,
+@@ -109,6 +111,12 @@
+      * Sends MAIN_EVENT_STOP_LISTENING to be handled in Run()
+      */
+     void StopListening();
++    void CsPttIntent(unsigned mode);
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++    bool CsFollowActive() const {return cs_follow_active_.load();}
++    bool CsWaitReply() const {return cs_wait_reply_.load();}
++    void CsServiceFollow(){xEventGroupSetBits(event_group_,MAIN_EVENT_FOLLOW_TICK);}
++#endif
+ 
+     void Reboot();
+     void WakeWordInvoke(const std::string& wake_word);
+@@ -129,6 +137,12 @@
+     void ResetProtocol();
+ 
+ private:
++    std::atomic<unsigned> cs_ptt_intent_{0};
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++    std::atomic<bool> cs_follow_active_{false},cs_wait_reply_{false};
++    void CsPollFollow();
++    void CsForgetFollow();
++#endif
+     Application();
+     ~Application();
+ 
+--- a/main/audio/engines/lite_audio_engine.cc
++++ b/main/audio/engines/lite_audio_engine.cc
+@@ -24,7 +24,12 @@
+     {
+         std::lock_guard<std::mutex> lock(wake_word_mutex_);
+         if (!CreateWakeWordLocked()) {
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT && CONFIG_USE_ESP_WAKE_WORD
++            // Still let PTT encode and send audio if detector allocation fails.
++            ESP_LOGW(TAG, "WakeNet unavailable; raw PTT stays available");
++#else
+             return false;
++#endif
+         }
+     }
+ 
+--- a/main/ota.cc
++++ b/main/ota.cc
+@@ -1,3 +1,7 @@
++#include "sdkconfig.h"
++#if CONFIG_COMMONSCOPE_C3_XZVIEW
++extern "C" void commonscope_clock_anchor(unsigned);
++#endif
+ #include "ota.h"
+ #include "assets/lang_config.h"
+ #include "cjson_utils.h"
+@@ -231,6 +235,9 @@
+             // 设置系统时间
+             struct timeval tv;
+             double ts = timestamp->valuedouble;
++#if CONFIG_COMMONSCOPE_C3_XZVIEW
++            if(ts>=1704067200000.0 && ts<4102444800000.0)commonscope_clock_anchor((unsigned)(ts/1000.0));
++#endif
+             
+             // 如果有时区偏移，计算本地时间
+             if (cJSON_IsNumber(timezone_offset)) {
+@@ -281,6 +288,10 @@
+ }
+ 
+ void Ota::MarkCurrentVersionValid() {
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT
++    // Local paired maintenance owns boot acceptance and image authentication.
++    return;
++#endif
+     auto partition = esp_ota_get_running_partition();
+     if (strcmp(partition->label, "factory") == 0) {
+         ESP_LOGI(TAG, "Running from factory partition, skipping");
+@@ -301,6 +312,10 @@
+ }
+ 
+ bool Ota::Upgrade(const std::string& firmware_url, std::function<void(int progress, size_t speed)> callback) {
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT
++    // Local paired maintenance owns boot acceptance and image authentication.
++    return false;
++#endif
+     ESP_LOGI(TAG, "Upgrading firmware from %s", firmware_url.c_str());
+     esp_ota_handle_t update_handle = 0;
+     auto update_partition = esp_ota_get_next_update_partition(NULL);
+--- a/scripts/build_default_assets.py
++++ b/scripts/build_default_assets.py
+@@ -1022,6 +1022,14 @@
+     elif wakenet_model_names:
+         print(f"  Note: Found wakenet models {wakenet_model_names} but wake word type is not ESP/AFE, skipping")
+     
++    # The paired 4 MiB panel links its single verified WN9s package into the A/B
++    # app. Do not duplicate it in the shared UI assets partition.
++    if (wakenet_model_paths and 'CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT=y' in
++            Path(args.sdkconfig).read_text(encoding='utf-8').splitlines()):
++        if [os.path.basename(os.path.normpath(x)) for x in wakenet_model_paths] != ['wn9s_nihaoxiaozhi']:
++            parser.error("This panel embeds only wn9s_nihaoxiaozhi")
++        wakenet_model_paths = []
++
+     # 2. Error check: if USE_CUSTOM_WAKE_WORD=y but no multinet models selected, report error
+     if wake_word_config['use_custom_wake_word'] and not multinet_model_names:
+         print("Error: USE_CUSTOM_WAKE_WORD is enabled but no multinet models are selected in sdkconfig")

@@ -1,0 +1,19 @@
+#include "ptt.h"
+#include <assert.h>
+#include <stdio.h>
+static Ptt p={0}; static int n;
+#define TEST(ms,k,ok,link,wanted) do{assert(ptt_step(&p,ms,k,ok,link)==wanted);n++;}while(0)
+int main(void){
+ TEST(0,2,1,1,QUIET); TEST(1000,0,1,1,QUIET);
+ TEST(1100,2,1,1,QUIET);TEST(1270,0,1,1,SHOW_IP);
+ TEST(1400,2,1,1,QUIET);TEST(1899,2,1,1,QUIET);TEST(1900,2,1,1,START_AUDIO);
+ TEST(1950,2,1,1,QUIET);TEST(2130,0,1,1,SUBMIT_AUDIO);TEST(2131,0,1,1,QUIET);
+ TEST(2200,1,1,0,QUIET);TEST(2300,0,1,0,SHOW_IP);
+ TEST(2400,2,1,1,QUIET);TEST(2600,3,1,1,QUIET);TEST(5800,2,1,1,QUIET);TEST(5900,0,1,1,QUIET);
+ TEST(6000,2,1,1,QUIET);TEST(6500,2,1,1,START_AUDIO);TEST(6600,2,0,1,CANCEL_AUDIO);
+ TEST(6700,2,1,1,QUIET);TEST(6800,0,1,1,QUIET);
+ TEST(6900,2,1,1,QUIET);TEST(7400,2,1,1,START_AUDIO);TEST(7410,0,1,0,CANCEL_AUDIO);TEST(7500,0,1,1,QUIET);
+ TEST(7600,2,1,0,QUIET);TEST(8100,2,1,0,QUIET);TEST(8200,0,1,1,QUIET);
+ TEST(0xffffff00u,2,1,1,QUIET);TEST(244u,2,1,1,START_AUDIO);TEST(300,0,1,1,SUBMIT_AUDIO);
+ printf("PASS %d gesture samples; host only, no hardware or firmware writes\n",n);
+}

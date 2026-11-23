@@ -1,0 +1,98 @@
+--- a/main/CMakeLists.txt
++++ b/main/CMakeLists.txt
+@@ -91,7 +91,9 @@
+ 
+ # Select the board source directory from Kconfig
+ # Set default assets if the board uses partition table V2
+-if(CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI)
++if(CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT)
++    set(BOARD_DIR "commonscope-c3-ptt")
++elseif(CONFIG_BOARD_TYPE_BREAD_COMPACT_WIFI)
+     set(BOARD_DIR "bread-compact-wifi")
+     set(BUILTIN_TEXT_FONT font_noto_sans_basic_14_1)
+     set(BUILTIN_ICON_FONT font_material_symbols_14_1)
+--- a/main/Kconfig.projbuild
++++ b/main/Kconfig.projbuild
+@@ -187,6 +187,9 @@
+     config BOARD_TYPE_CHD_ESP32S3_EYE
+         bool "CHD ESP32-S3-EYE (虫洞)"
+         depends on IDF_TARGET_ESP32S3
++    config BOARD_TYPE_COMMONSCOPE_C3_PTT
++        bool "CommonScope C3 PTT (original display)"
++        depends on IDF_TARGET_ESP32C3
+     config BOARD_TYPE_CYBERAI_VOCAT_V2_0
+         bool "Cyberai-Vocat-V2.0"
+         depends on IDF_TARGET_ESP32S3
+--- a/main/application.cc
++++ b/main/application.cc
+@@ -858,6 +858,13 @@
+ }
+ 
+ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT
++    if(mode==kListeningModeManualStop && cs_ptt_intent_.load()!=1){
++        if(protocol_ && protocol_->IsAudioChannelOpened())protocol_->CloseAudioChannel();
++        SetDeviceState(kDeviceStateIdle);return;
++    }
++#endif
++
+     // Check state again in case it was changed during scheduling
+     if (GetDeviceState() != kDeviceStateConnecting) {
+         return;
+@@ -876,6 +883,13 @@
+         }
+     }
+ 
++
++#if CONFIG_BOARD_TYPE_COMMONSCOPE_C3_PTT
++    if(mode==kListeningModeManualStop && cs_ptt_intent_.load()!=1){
++        if(protocol_ && protocol_->IsAudioChannelOpened())protocol_->CloseAudioChannel();
++        SetDeviceState(kDeviceStateIdle);return;
++    }
++#endif
+     SetListeningMode(mode);
+ }
+ 
+@@ -1478,3 +1492,16 @@
+         protocol_.reset();
+     });
+ }
++
++void Application::CsPttIntent(unsigned mode){
++    cs_ptt_intent_.store(mode);
++    Schedule([this,mode](){
++        if(cs_ptt_intent_.load()!=mode)return;
++        if(mode==1 && GetDeviceState()==kDeviceStateIdle)HandleStartListeningEvent();
++        else if(mode==2 && GetDeviceState()==kDeviceStateListening)HandleStopListeningEvent();
++        else if(mode==3 || (mode==2 && GetDeviceState()==kDeviceStateConnecting)){
++            if(protocol_ && protocol_->IsAudioChannelOpened())protocol_->CloseAudioChannel();
++            SetDeviceState(kDeviceStateIdle);
++        }
++    });
++}
+--- a/main/application.h
++++ b/main/application.h
+@@ -7,6 +7,7 @@
+ #include <esp_timer.h>
+ 
+ #include <string>
++#include <atomic>
+ #include <mutex>
+ #include <deque>
+ #include <memory>
+@@ -109,6 +110,7 @@
+      * Sends MAIN_EVENT_STOP_LISTENING to be handled in Run()
+      */
+     void StopListening();
++    void CsPttIntent(unsigned mode);
+ 
+     void Reboot();
+     void WakeWordInvoke(const std::string& wake_word);
+@@ -129,6 +131,7 @@
+     void ResetProtocol();
+ 
+ private:
++    std::atomic<unsigned> cs_ptt_intent_{0};
+     Application();
+     ~Application();
+ 

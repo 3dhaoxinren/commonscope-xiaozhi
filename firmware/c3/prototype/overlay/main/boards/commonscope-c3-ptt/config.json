@@ -1,0 +1,16 @@
+{
+  "type": "commonscope-c3-ptt",
+  "target": "esp32c3",
+  "builds": [
+    {
+      "name": "commonscope-c3-ptt",
+      "sdkconfig_append": [
+        "CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y",
+        "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/v2/4m.csv\"",
+        "CONFIG_WAKE_WORD_DISABLED=y",
+        "CONFIG_USE_DEVICE_AEC=n",
+        "CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y"
+      ]
+    }
+  ]
+}

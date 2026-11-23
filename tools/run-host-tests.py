@@ -10,7 +10,8 @@ firm=repo/'firmware'
 tool=[args.cc]+(['cc'] if Path(args.cc).stem.lower()=='zig' else [])
 cases={'bridge':[firm/'shared/test_bridge.c'],
        'gesture':[firm/'shared/test_ptt.c'],
-       'panel_wifi':[firm/'panel/wifi/test_runtime.c',firm/'panel/wifi/wifi_runtime.c']}
+       'panel_wifi':[firm/'panel/wifi/test_runtime.c',firm/'panel/wifi/wifi_runtime.c'],
+       'panel_boot_ap':[firm/'panel/boot-ap/test_boot_ap.c',firm/'panel/boot-ap/panel_boot_ap.c']}
 with tempfile.TemporaryDirectory(prefix='commonscope-host-') as d:
  for case,files in cases.items():
   out=Path(d)/(case+('.exe' if os.name=='nt' else ''))

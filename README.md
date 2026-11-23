@@ -5,7 +5,7 @@
 ## 从哪里开始
 
 1. [先认板和接线](docs/wiring.md)：TXW818 绿板和 ESP32-C3 是两个不同的目标，不能混刷。
-2. [初版拍照屏：第一次刷机与设备热点](docs/txw818-first-flash-hotspot.md)：保留原绿板基线、打开原机 Wi-Fi 入口、核对 OTA，刷后重连设备热点。
+2. [初版拍照屏：第一次刷机与设备热点](docs/txw818-first-flash-hotspot.md)：保留原绿板基线、打开原机 Wi-Fi 入口、核对 OTA，刷后重连设备热点。 需要拿底包或合并开机热点代码的，见 [TXW818 底包与 SDK 合并](docs/txw818-base-and-boot-ap.md)。
 3. [ESP32-C3：从源码编译、首次 USB 刷写与热点配网](docs/c3-build-and-first-boot.md)：固定 XiaoZhi 上游提交，先用按键版确认上电和配网。
 4. [公开范围及验证](docs/verification.md)：实机历史和本仓新验证分开列；不把能编译或能写入等同于整机验收。
 
